@@ -614,7 +614,23 @@ class ClaudeTranslator:
         self.anthropic = anthropic
         self.client = anthropic.Anthropic(max_retries=5)
         self.lang, self.model, self.effort, self.cache = lang, model, effort, cache
+        self.lock = threading.Lock()
+        self.requests = self.input_tokens = self.output_tokens = 0
+        self.served_by = set()          # models that actually answered (differs only if a fallback ran)
         self.system = SYSTEM_PROMPT.format(lang=lang, glossary=f"\nGlossary (always use):\n{glossary}" if glossary else "")
+
+    def verify(self) -> str:
+        """Fail fast, before any OCR work, if the key or model is not usable. Returns the masked key."""
+        key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        if not key:
+            sys.exit("ANTHROPIC_API_KEY is not set. Run:  export ANTHROPIC_API_KEY=\"sk-ant-...\"")
+        try:
+            self.client.models.retrieve(self.model)
+        except self.anthropic.AuthenticationError:
+            sys.exit("ANTHROPIC_API_KEY is set but the API rejected it (invalid or revoked key).")
+        except self.anthropic.NotFoundError:
+            sys.exit(f"The API key works, but model '{self.model}' is not available to it. Try --model.")
+        return f"{key[:7]}...{key[-4:]}"
 
     def _call(self, content: list, schema: dict, system: str) -> dict:
         kwargs = dict(model=self.model, max_tokens=32000, system=system,
@@ -624,6 +640,11 @@ class ClaudeTranslator:
             kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
         with self.client.beta.messages.stream(**kwargs) as stream:
             msg = stream.get_final_message()
+        with self.lock:
+            self.requests += 1
+            self.input_tokens += msg.usage.input_tokens
+            self.output_tokens += msg.usage.output_tokens
+            self.served_by.add(msg.model)
         if msg.stop_reason == "refusal":
             raise RuntimeError(f"model declined: {getattr(msg.stop_details, 'explanation', '')}")
         if msg.stop_reason == "max_tokens":
@@ -678,6 +699,7 @@ class PseudoTranslator:
     """Offline stand-in: accents letters and makes text ~30% longer, like EN->DE expansion.
     Exercises the whole pipeline (layout, erasing, fitting) without an API key."""
     name = "pseudo"
+    requests = 0
     MAP = str.maketrans("aeiouAEIOUcnyC", "àéîöüÀÉÎÖÜçñýÇ")
 
     def __init__(self, *_, **__):
@@ -958,8 +980,8 @@ def finish_scanned_page(page, job: PageJob) -> None:
     page.insert_image(page.rect, stream=jpg.tobytes())
 
 
-def draw_debug(doc_path: str, jobs: list[PageJob], out_path: str) -> None:
-    dbg = pymupdf.open(doc_path)
+def draw_debug(pdf_bytes: bytes, jobs: list[PageJob], out_path: str) -> None:
+    dbg = pymupdf.open("pdf", pdf_bytes)
     for job in jobs:
         page = dbg[job.index]
         for b in job.blocks:
@@ -998,24 +1020,36 @@ def main():
     ap.add_argument("--pages", help="1-based pages, e.g. 1-3,7")
     ap.add_argument("--workers", type=int, default=4, help="parallel LLM requests")
     ap.add_argument("--chunk-chars", type=int, default=6000, help="max source chars per LLM request")
-    ap.add_argument("--debug", action="store_true", help="also write a PDF showing the detected blocks")
+    ap.add_argument("--check", action="store_true", help="only verify the API key and model, then exit")
+    ap.add_argument("--report", action="store_true", help="also write <output>.report.json (per-block details)")
+    ap.add_argument("--cache", metavar="FILE", help="reuse/save translations in this JSON file across runs")
+    ap.add_argument("--debug", action="store_true", help="also write <output>.layout.pdf showing the detected blocks")
     args = ap.parse_args()
 
     src = args.input
+    glossary = open(args.glossary, encoding="utf-8").read() if args.glossary else ""
+    cache = Cache(args.cache if args.translator == "claude" else None)
+    tr = (ClaudeTranslator(args.target, args.model, args.effort, glossary, cache)
+          if args.translator == "claude" else PseudoTranslator())
+    if args.translator == "claude":
+        masked = tr.verify()
+        print(f"Translator: Claude API, model {args.model} (key {masked} verified)")
+        if args.check:
+            return
+    else:
+        print("Translator: PSEUDO (offline test mode, NOT a real translation, no LLM is called)")
+
     ext = os.path.splitext(src)[1].lower()
     is_image = ext != ".pdf"
     slug = re.sub(r"\W+", "_", args.target.lower()).strip("_")
     out = args.output or f"{os.path.splitext(src)[0]}.{slug}{ext}"
 
     if is_image:
-        doc, img_dpi = image_to_pdf(src, 150)
+        doc, img_dpi = image_to_pdf(src, 150)      # in memory only, no temporary file
         args.dpi, args.force_ocr = img_dpi, True
-        work_pdf = os.path.splitext(out)[0] + ".work.pdf"
-        doc.save(work_pdf)
-        doc = pymupdf.open(work_pdf)
     else:
         doc = pymupdf.open(src)
-        work_pdf = src
+    original_pdf = doc.tobytes() if args.debug else None
     for p in doc:
         if p.rotation:
             p.remove_rotation()
@@ -1026,10 +1060,6 @@ def main():
                         for i in (range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1))
                         if 0 < i <= len(doc)})
 
-    cache = Cache(os.path.splitext(out)[0] + ".cache.json" if args.translator == "claude" else None)
-    glossary = open(args.glossary, encoding="utf-8").read() if args.glossary else ""
-    tr = (ClaudeTranslator(args.target, args.model, args.effort, glossary, cache)
-          if args.translator == "claude" else PseudoTranslator())
     llama = LlamaParseOCR(src) if args.ocr == "llamaparse" else None
     fitter = Fitter(args.min_scale, args.target.lower().split()[-1] in RTL_LANGS)
 
@@ -1078,15 +1108,23 @@ def main():
         else:   # tif, bmp, webp ...
             arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)
             cv2.imwrite(out, cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
-        if args.debug:
-            draw_debug(work_pdf, jobs, os.path.splitext(out)[0] + ".layout.pdf")
         doc.close()
-        os.remove(work_pdf)
     else:
         doc.subset_fonts()
         doc.ez_save(out)
-        if args.debug:
-            draw_debug(src, jobs, os.path.splitext(out)[0] + ".layout.pdf")
+    if args.debug:
+        draw_debug(original_pdf, jobs, os.path.splitext(out)[0] + ".layout.pdf")
+
+    done = sum(b.translate for j in jobs for b in j.blocks)
+    kept = sum(1 for j in jobs for b in j.blocks if b.translation is None and HAS_LETTER.search(b.plain))
+    if args.translator == "claude":
+        print(f"Claude API: {tr.requests} requests, {tr.input_tokens:,} input + {tr.output_tokens:,} output tokens, "
+              f"answered by {', '.join(sorted(tr.served_by)) or '-'}"
+              + (f" ({len(cache.data)} cached translations available)" if args.cache else ""))
+    print(f"{done} text blocks translated" + (f", {kept} left in the original language (see warnings)" if kept else ""))
+    if not args.report:
+        print(f"done in {round(time.time() - t0, 1)}s -> {out}")
+        return
 
     report = {"input": src, "output": out, "target": args.target, "translator": tr.name,
               "seconds": round(time.time() - t0, 1), "pages": [

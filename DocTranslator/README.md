@@ -43,7 +43,7 @@ Table cells never leave their cell, and their text stays vertically centred.
 * No OCR on digital PDFs: the text layer is exact.
 * Scans are rendered at 300 DPI, and small images are upscaled 2× before OCR. A vision LLM then fixes the OCR text using the page image, in the same request as the translation.
 * One request per page, not per block, with up to `--workers` pages in parallel. Blocks without letters (numbers, `+12%`, `$4.2M`) are never sent.
-* Translations are cached on disk (`<output>.cache.json`), so re-runs and repeated headers or footers are not billed again.
+* Optional cache (`--cache translations.json`), so re-runs and repeated headers or footers are not billed again.
 * Structured JSON output (`output_config.format`), so ids can't get lost; missing ids are retried once.
 * Optional glossary (`--glossary terms.txt`).
 
@@ -54,6 +54,7 @@ pip install -r requirements.txt
 sudo apt install tesseract-ocr            # + tesseract-ocr-deu, -fra, ... for other source languages
 export ANTHROPIC_API_KEY=...
 
+python doc_translate.py report.pdf -t German --check   # verify key + model only, translates nothing
 python doc_translate.py report.pdf -t German
 python doc_translate.py scan.jpg  -t "Brazilian Portuguese" --ocr-lang eng
 python doc_translate.py scan.pdf  -t Japanese --effort high --glossary glossary.txt
@@ -61,9 +62,15 @@ python doc_translate.py scan.pdf  -t Spanish --ocr llamaparse      # needs LLAMA
 python doc_translate.py report.pdf -t French --translator pseudo --debug   # offline dry run + layout overlay
 ```
 
-Outputs: `<input>.<lang>.<ext>` (same format as the input), `<…>.report.json` (per block: source,
-translation, font scale, condensed or overflow), and with `--debug`, `<…>.layout.pdf`, which shows every
-detected block (blue = text, green = table cell, grey = left untouched).
+Output: **one file**, `<input>.<lang>.<ext>`, in the input's format (PDF → PDF, PNG → PNG, JPG → JPG),
+or the path given with `-o`. Extra files are written only if you ask for them:
+`--report` (`<…>.report.json`: source, translation, font scale, condensed/overflow per block),
+`--debug` (`<…>.layout.pdf` with every detected block outlined), `--cache FILE`.
+
+Before any work, the script checks the API key and model and prints e.g.
+`Translator: Claude API, model claude-opus-5-5 (key sk-ant-...abcd verified)`. At the end it prints the
+number of Claude requests, the tokens used and which model answered, so you can see the LLM did the
+translation. `--translator pseudo` prints a warning that no LLM is called.
 
 Main options: `--model` (default `claude-opus-5-5`), `--effort low|medium|high|xhigh|max`,
 `--min-scale`, `--pages 1-3,7`, `--workers`, `--force-ocr`, `--dpi`, `--no-ocr-refine`.
